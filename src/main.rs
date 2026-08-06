@@ -157,7 +157,12 @@ async fn connect(url: &str) -> Result<Connection> {
 /// Sobe o endpoint /metrics; sem servidor HTTP próprio o Prometheus não teria como raspar o worker.
 fn install_metrics() -> Result<()> {
   let port: u16 = env::var("METRICS_PORT").ok().and_then(|value| value.parse().ok()).unwrap_or(9100);
+  // Sem buckets explícitos o exporter publica summaries, e o dashboard não teria as
+  // séries _bucket de que histogram_quantile precisa.
+  const BUCKETS: [f64; 9] = [0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0, 120.0, 300.0];
   PrometheusBuilder::new()
+    .set_buckets(&BUCKETS)
+    .context("buckets inválidos")?
     .with_http_listener(SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), port))
     .install()
     .context("não foi possível expor as métricas")?;
