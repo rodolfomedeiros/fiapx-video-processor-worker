@@ -1,59 +1,203 @@
+//! Consome `video.received`, extrai os quadros com FFmpeg e devolve o ZIP ao object storage.
 use anyhow::{Context, Result};
 use aws_config::BehaviorVersion;
 use aws_credential_types::Credentials;
 use aws_sdk_s3::{config::Region, primitives::ByteStream, Client as S3Client};
-use chrono::Utc;
 use futures_util::StreamExt;
-use lapin::{options::*, types::FieldTable, BasicProperties, Channel, Connection, ConnectionProperties, ExchangeKind};
-use serde::{Deserialize, Serialize};
-use std::{env, fs::{self, File}, io::{Read, Write}, process::Command, time::Duration};
+use lapin::{
+  options::*,
+  types::{AMQPValue, FieldTable},
+  BasicProperties, Channel, Connection, ConnectionProperties, ExchangeKind,
+};
+use std::{env, fs, time::Duration};
 use tempfile::tempdir;
-use tokio_amqp::*;
-use uuid::Uuid;
+use worker::{
+  decide, extract_frames, result_key, zip_frames, Outcome, VideoEvent, EXCHANGE, FAILED_KEY, PROCESSING_QUEUE,
+  RECEIVED_KEY,
+};
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct VideoEvent { event_id: Uuid, event_type: String, occurred_at: String, video_id: Uuid, user_id: Uuid, attempt: u8, raw_file_path: Option<String>, zip_file_path: Option<String>, frame_count: Option<u32>, status: Option<String>, error_message: Option<String>, user_email: Option<String> }
-fn now() -> String { Utc::now().to_rfc3339() }
-fn status_event(source: &VideoEvent, state: &str, extra: impl FnOnce(&mut VideoEvent)) -> VideoEvent { let mut event=VideoEvent { event_id:Uuid::new_v4(), event_type:"video.status.changed".into(), occurred_at:now(), video_id:source.video_id, user_id:source.user_id, attempt:source.attempt, raw_file_path:None, zip_file_path:None, frame_count:None, status:Some(state.into()), error_message:None, user_email:source.user_email.clone() }; extra(&mut event); event }
-async fn publish(channel: &Channel, key: &str, event: &VideoEvent) -> Result<()> {
+fn bucket() -> String {
+  env::var("S3_BUCKET").unwrap_or_else(|_| "videos".into())
+}
+
+async fn publish(channel: &Channel, routing_key: &str, event: &VideoEvent) -> Result<()> {
   let body = serde_json::to_vec(event)?;
-  channel.basic_publish("video.events", key, BasicPublishOptions::default(), &body, BasicProperties::default().with_delivery_mode(2)).await?.await?;
+  channel
+    .basic_publish(
+      EXCHANGE,
+      routing_key,
+      BasicPublishOptions::default(),
+      &body,
+      BasicProperties::default().with_delivery_mode(2).with_content_type("application/json".into()),
+    )
+    .await?
+    .await?;
   Ok(())
 }
-async fn s3_client() -> S3Client { let endpoint=env::var("S3_ENDPOINT_URL").unwrap_or_else(|_|"http://localhost:9000".into()); let creds=Credentials::new(env::var("S3_ACCESS_KEY").unwrap_or_else(|_|"fiapx".into()),env::var("S3_SECRET_KEY").unwrap_or_else(|_|"fiapx-minio-password".into()),None,None,"env"); let shared=aws_config::defaults(BehaviorVersion::latest()).region(Region::new("us-east-1")).credentials_provider(creds).endpoint_url(endpoint).load().await; let config=aws_sdk_s3::config::Builder::from(&shared).force_path_style(true).build(); S3Client::from_conf(config) }
-async fn process(s3: &S3Client, event: &VideoEvent) -> Result<(String,u32)> {
-  let bucket=env::var("S3_BUCKET").unwrap_or_else(|_|"videos".into()); let key=event.raw_file_path.as_ref().context("evento sem raw_file_path")?;
-  let dir=tempdir()?; let input=dir.path().join("input"); let output=dir.path().join("frames"); fs::create_dir(&output)?;
-  let object=s3.get_object().bucket(&bucket).key(key).send().await?; let bytes=object.body.collect().await?.into_bytes(); fs::write(&input,bytes)?;
-  let frame_pattern=output.join("frame_%04d.png"); let result=Command::new("ffmpeg").args(["-i"]).arg(&input).args(["-vf","fps=1","-y"]).arg(&frame_pattern).output()?;
-  if !result.status.success() { anyhow::bail!("ffmpeg falhou: {}",String::from_utf8_lossy(&result.stderr)); }
-  let frames: Vec<_>=fs::read_dir(&output)?.filter_map(|e|e.ok()).filter(|e|e.path().extension().is_some_and(|x|x=="png")).collect(); if frames.is_empty(){ anyhow::bail!("nenhum frame extraído"); }
-  let zip_path=dir.path().join("frames.zip"); let zip_file=File::create(&zip_path)?; let mut zip=zip::ZipWriter::new(zip_file); let options=zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated);
-  for frame in &frames { let name=frame.file_name().to_string_lossy().to_string(); zip.start_file(name,options)?; let mut file=File::open(frame.path())?; let mut buffer=Vec::new(); file.read_to_end(&mut buffer)?; zip.write_all(&buffer)?; } zip.finish()?;
-  let result_key=format!("processed/{}/{}.zip",event.user_id,event.video_id); s3.put_object().bucket(bucket).key(&result_key).body(ByteStream::from_path(&zip_path).await?).content_type("application/zip").send().await?; Ok((result_key,frames.len() as u32))
+
+async fn s3_client() -> S3Client {
+  let endpoint = env::var("S3_ENDPOINT_URL").unwrap_or_else(|_| "http://localhost:9000".into());
+  let credentials = Credentials::new(
+    env::var("S3_ACCESS_KEY").unwrap_or_else(|_| "fiapx".into()),
+    env::var("S3_SECRET_KEY").unwrap_or_else(|_| "fiapx-minio-password".into()),
+    None,
+    None,
+    "env",
+  );
+  let shared = aws_config::defaults(BehaviorVersion::latest())
+    .region(Region::new("us-east-1"))
+    .credentials_provider(credentials)
+    .endpoint_url(endpoint)
+    .load()
+    .await;
+  S3Client::from_conf(aws_sdk_s3::config::Builder::from(&shared).force_path_style(true).build())
 }
-async fn handle(channel: &Channel, s3: &S3Client, event: VideoEvent) -> Result<()> { eprintln!("processing video {} (attempt {})", event.video_id, event.attempt); publish(channel,"video.status.changed",&status_event(&event,"PROCESSING", |_| {})).await?; match process(s3,&event).await { Ok((zip,frames)) => { eprintln!("completed video {}", event.video_id); publish(channel,"video.status.changed",&status_event(&event,"COMPLETED",|e| { e.zip_file_path=Some(zip); e.frame_count=Some(frames); })).await }, Err(_error) if event.attempt < 3 => { eprintln!("retrying video {}", event.video_id); tokio::time::sleep(Duration::from_secs(2u64.pow(event.attempt as u32))).await; let mut retry=event.clone(); retry.event_id=Uuid::new_v4(); retry.occurred_at=now(); retry.attempt+=1; publish(channel,"video.received",&retry).await }, Err(error) => { let message=error.to_string(); eprintln!("failing video {}: {}", event.video_id, message); publish(channel,"video.status.changed",&status_event(&event,"ERROR",|e| e.error_message=Some(message.clone()))).await?; let mut failed=event.clone(); failed.event_id=Uuid::new_v4(); failed.event_type="video.failed".into(); failed.occurred_at=now(); failed.error_message=Some(message); publish(channel,"video.failed",&failed).await } } }
-#[tokio::main]
-async fn main() -> Result<()> {
-  let rabbit = env::var("RABBITMQ_URL").unwrap_or_else(|_| "amqp://fiapx:fiapx@localhost:5672/%2F".into());
-  let connection = Connection::connect(&rabbit, ConnectionProperties::default().with_tokio()).await?;
-  let channel = connection.create_channel().await?;
-  channel.exchange_declare("video.events", ExchangeKind::Topic, ExchangeDeclareOptions { durable: true, ..Default::default() }, FieldTable::default()).await?;
-  let queue = channel.queue_declare("video-processing-queue", QueueDeclareOptions { durable: true, ..Default::default() }, FieldTable::default()).await?;
-  channel.queue_bind(queue.name().as_str(), "video.events", "video.received", QueueBindOptions::default(), FieldTable::default()).await?;
-  channel.basic_qos(4, BasicQosOptions::default()).await?;
-  let s3 = s3_client().await;
-  let mut consumer = channel.basic_consume(queue.name().as_str(), "fiapx-worker", BasicConsumeOptions::default(), FieldTable::default()).await?;
-  while let Some(delivery) = consumer.next().await {
-    let delivery = delivery?;
-    let event: VideoEvent = serde_json::from_slice(&delivery.data)?;
-    match handle(&channel, &s3, event).await {
-      Ok(()) => delivery.ack(BasicAckOptions::default()).await?,
-      Err(error) => {
-        eprintln!("processing error: {error:#}");
-        delivery.nack(BasicNackOptions { requeue: true, ..Default::default() }).await?;
+
+/// Baixa o original, extrai os quadros, compacta e devolve a chave do ZIP e o total de quadros.
+async fn process(s3: &S3Client, event: &VideoEvent) -> Result<(String, u32)> {
+  let bucket = bucket();
+  let key = event.raw_file_path.as_ref().context("evento sem raw_file_path")?;
+
+  let directory = tempdir()?;
+  let input = directory.path().join("input");
+  let frames_dir = directory.path().join("frames");
+  fs::create_dir(&frames_dir)?;
+
+  let object = s3.get_object().bucket(&bucket).key(key).send().await?;
+  fs::write(&input, object.body.collect().await?.into_bytes())?;
+
+  let frames = extract_frames(&input, &frames_dir)?;
+  let zip_path = directory.path().join("frames.zip");
+  let frame_count = zip_frames(&frames, &zip_path)?;
+
+  let destination = result_key(&event.user_id, &event.video_id);
+  s3.put_object()
+    .bucket(bucket)
+    .key(&destination)
+    .body(ByteStream::from_path(&zip_path).await?)
+    .content_type("application/zip")
+    .send()
+    .await?;
+  Ok((destination, frame_count))
+}
+
+async fn handle(channel: &Channel, s3: &S3Client, event: VideoEvent) -> Result<()> {
+  eprintln!("processando vídeo {} (tentativa {})", event.video_id, event.attempt);
+  publish(channel, worker::STATUS_KEY, &event.processing()).await?;
+
+  match process(s3, &event).await {
+    Ok((zip_path, frame_count)) => {
+      eprintln!("vídeo {} concluído com {frame_count} quadros", event.video_id);
+      publish(channel, worker::STATUS_KEY, &event.completed(zip_path, frame_count)).await
+    }
+    Err(error) => {
+      let message = format!("{error:#}");
+      match decide(&event, &message) {
+        Outcome::Retry { event: retry, backoff } => {
+          eprintln!("vídeo {} falhou ({message}), retentando em {:?}", event.video_id, backoff);
+          tokio::time::sleep(backoff).await;
+          publish(channel, RECEIVED_KEY, &retry).await
+        }
+        Outcome::GiveUp { status, failure } => {
+          eprintln!("vídeo {} esgotou as tentativas: {message}", event.video_id);
+          publish(channel, worker::STATUS_KEY, &status).await?;
+          publish(channel, FAILED_KEY, &failure).await
+        }
       }
     }
+  }
+}
+
+/// Declara a fila com os mesmos argumentos de `fiapx-platform/rabbitmq/definitions.json`.
+/// Divergir daqui faz o broker responder PRECONDITION_FAILED e derruba o worker no boot.
+fn processing_queue_arguments() -> FieldTable {
+  let mut arguments = FieldTable::default();
+  arguments.insert("x-dead-letter-exchange".into(), AMQPValue::LongString(EXCHANGE.into()));
+  arguments.insert("x-dead-letter-routing-key".into(), AMQPValue::LongString(FAILED_KEY.into()));
+  arguments
+}
+
+fn connection_properties() -> ConnectionProperties {
+  ConnectionProperties::default()
+    .with_executor(tokio_executor_trait::Tokio::current())
+    .with_reactor(tokio_reactor_trait::Tokio)
+}
+
+async fn connect(url: &str) -> Result<Connection> {
+  let mut last_error = None;
+  for attempt in 1..=20 {
+    match Connection::connect(url, connection_properties()).await {
+      Ok(connection) => return Ok(connection),
+      Err(error) => {
+        eprintln!("RabbitMQ indisponível (tentativa {attempt}/20): {error}");
+        last_error = Some(error);
+        tokio::time::sleep(Duration::from_secs(3)).await;
+      }
+    }
+  }
+  Err(anyhow::anyhow!("não foi possível conectar ao RabbitMQ")).context(last_error.unwrap())
+}
+
+#[tokio::main]
+async fn main() -> Result<()> {
+  let url = env::var("RABBITMQ_URL").unwrap_or_else(|_| "amqp://fiapx:fiapx@localhost:5672/%2F".into());
+  let connection = connect(&url).await?;
+  let channel = connection.create_channel().await?;
+
+  channel
+    .exchange_declare(
+      EXCHANGE,
+      ExchangeKind::Topic,
+      ExchangeDeclareOptions { durable: true, ..Default::default() },
+      FieldTable::default(),
+    )
+    .await?;
+  channel
+    .queue_declare(
+      PROCESSING_QUEUE,
+      QueueDeclareOptions { durable: true, ..Default::default() },
+      processing_queue_arguments(),
+    )
+    .await?;
+  channel
+    .queue_bind(PROCESSING_QUEUE, EXCHANGE, RECEIVED_KEY, QueueBindOptions::default(), FieldTable::default())
+    .await?;
+
+  let prefetch: u16 = env::var("PREFETCH").ok().and_then(|value| value.parse().ok()).unwrap_or(4);
+  channel.basic_qos(prefetch, BasicQosOptions::default()).await?;
+
+  let s3 = s3_client().await;
+  let mut consumer = channel
+    .basic_consume(PROCESSING_QUEUE, "fiapx-worker", BasicConsumeOptions::default(), FieldTable::default())
+    .await?;
+  eprintln!("worker pronto, processando até {prefetch} vídeos simultâneos");
+
+  while let Some(delivery) = consumer.next().await {
+    let delivery = delivery?;
+    let (channel, s3) = (channel.clone(), s3.clone());
+    // Uma task por mensagem: o laço sequencial anterior processava um vídeo de cada vez,
+    // e o sleep do backoff bloqueava a fila inteira.
+    tokio::spawn(async move {
+      let event: VideoEvent = match serde_json::from_slice(&delivery.data) {
+        Ok(event) => event,
+        Err(error) => {
+          eprintln!("evento ilegível, descartando: {error}");
+          let _ = delivery.reject(BasicRejectOptions { requeue: false }).await;
+          return;
+        }
+      };
+      match handle(&channel, &s3, event).await {
+        Ok(()) => {
+          let _ = delivery.ack(BasicAckOptions::default()).await;
+        }
+        Err(error) => {
+          // Só chega aqui se a própria publicação falhou. Devolver à fila criaria um laço
+          // quente, então a mensagem vai para a DLQ e o usuário é avisado por e-mail.
+          eprintln!("falha ao publicar o resultado: {error:#}");
+          let _ = delivery.reject(BasicRejectOptions { requeue: false }).await;
+        }
+      }
+    });
   }
   Ok(())
 }

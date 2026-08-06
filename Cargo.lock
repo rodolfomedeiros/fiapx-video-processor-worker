@@ -1352,7 +1352,7 @@ dependencies = [
 
 [[package]]
 name = "fiapx-video-processor-worker"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "anyhow",
  "aws-config",
@@ -1365,7 +1365,8 @@ dependencies = [
  "serde_json",
  "tempfile",
  "tokio",
- "tokio-amqp",
+ "tokio-executor-trait",
+ "tokio-reactor-trait",
  "uuid",
  "zip",
 ]
@@ -3218,17 +3219,6 @@ dependencies = [
  "socket2 0.6.5",
  "tokio-macros",
  "windows-sys 0.61.2",
-]
-
-[[package]]
-name = "tokio-amqp"
-version = "2.0.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8fe356ad388da0ad528624456b6e59f051bf674e0a3eb9d14cf78e35939eb364"
-dependencies = [
- "lapin",
- "tokio-executor-trait",
- "tokio-reactor-trait",
 ]
 
 [[package]]

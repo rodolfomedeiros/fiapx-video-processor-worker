@@ -6,6 +6,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-        with: { toolchain: '1.88' }
+        with: { toolchain: '1.88', components: clippy }
+      - run: cargo clippy --all-targets -- -D warnings
       - run: cargo test
       - run: docker build .
