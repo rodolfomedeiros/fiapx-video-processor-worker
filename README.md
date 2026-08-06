@@ -1,6 +1,6 @@
 # fiapx-video-processor-worker
 
-Worker Rust 1.88 (compatível com o requisito mínimo 1.85+) que consome eventos de vídeo, extrai PNGs com FFmpeg, grava o ZIP no MinIO e publica transições de estado.
+Worker Rust 1.94 (compatível com o requisito mínimo 1.85+; a versão exata segue o piso exigido pelas dependências AWS) que consome eventos de vídeo, extrai PNGs com FFmpeg, grava o ZIP no MinIO e publica transições de estado.
 
 ## Organização
 
