@@ -9,7 +9,13 @@ use lapin::{
   types::{AMQPValue, FieldTable},
   BasicProperties, Channel, Connection, ConnectionProperties, ExchangeKind,
 };
-use std::{env, fs, time::Duration};
+use metrics::{counter, gauge, histogram};
+use metrics_exporter_prometheus::PrometheusBuilder;
+use std::{
+  env, fs,
+  net::{IpAddr, Ipv4Addr, SocketAddr},
+  time::{Duration, Instant},
+};
 use tempfile::tempdir;
 use worker::{
   decide, extract_frames, result_key, zip_frames, Outcome, VideoEvent, EXCHANGE, FAILED_KEY, PROCESSING_QUEUE,
@@ -85,9 +91,17 @@ async fn handle(channel: &Channel, s3: &S3Client, event: VideoEvent) -> Result<(
   eprintln!("processando vídeo {} (tentativa {})", event.video_id, event.attempt);
   publish(channel, worker::STATUS_KEY, &event.processing()).await?;
 
-  match process(s3, &event).await {
+  gauge!("fiapx_worker_videos_in_flight").increment(1.0);
+  let started = Instant::now();
+  let result = process(s3, &event).await;
+  gauge!("fiapx_worker_videos_in_flight").decrement(1.0);
+  histogram!("fiapx_worker_processing_duration_seconds").record(started.elapsed().as_secs_f64());
+
+  match result {
     Ok((zip_path, frame_count)) => {
       eprintln!("vídeo {} concluído com {frame_count} quadros", event.video_id);
+      counter!("fiapx_worker_videos_total", "outcome" => "completed").increment(1);
+      counter!("fiapx_worker_frames_extracted_total").increment(u64::from(frame_count));
       publish(channel, worker::STATUS_KEY, &event.completed(zip_path, frame_count)).await
     }
     Err(error) => {
@@ -95,11 +109,13 @@ async fn handle(channel: &Channel, s3: &S3Client, event: VideoEvent) -> Result<(
       match decide(&event, &message) {
         Outcome::Retry { event: retry, backoff } => {
           eprintln!("vídeo {} falhou ({message}), retentando em {:?}", event.video_id, backoff);
+          counter!("fiapx_worker_videos_total", "outcome" => "retried").increment(1);
           tokio::time::sleep(backoff).await;
           publish(channel, RECEIVED_KEY, &retry).await
         }
         Outcome::GiveUp { status, failure } => {
           eprintln!("vídeo {} esgotou as tentativas: {message}", event.video_id);
+          counter!("fiapx_worker_videos_total", "outcome" => "failed").increment(1);
           publish(channel, worker::STATUS_KEY, &status).await?;
           publish(channel, FAILED_KEY, &failure).await
         }
@@ -138,8 +154,20 @@ async fn connect(url: &str) -> Result<Connection> {
   Err(anyhow::anyhow!("não foi possível conectar ao RabbitMQ")).context(last_error.unwrap())
 }
 
+/// Sobe o endpoint /metrics; sem servidor HTTP próprio o Prometheus não teria como raspar o worker.
+fn install_metrics() -> Result<()> {
+  let port: u16 = env::var("METRICS_PORT").ok().and_then(|value| value.parse().ok()).unwrap_or(9100);
+  PrometheusBuilder::new()
+    .with_http_listener(SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), port))
+    .install()
+    .context("não foi possível expor as métricas")?;
+  eprintln!("métricas em :{port}/metrics");
+  Ok(())
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
+  install_metrics()?;
   let url = env::var("RABBITMQ_URL").unwrap_or_else(|_| "amqp://fiapx:fiapx@localhost:5672/%2F".into());
   let connection = connect(&url).await?;
   let channel = connection.create_channel().await?;
