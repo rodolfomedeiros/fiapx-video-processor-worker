@@ -18,6 +18,7 @@ transição de estado no barramento.
 | [fiapx-video-management-service](https://github.com/rodolfomedeiros/fiapx-video-management-service) | Python 3.13 · FastAPI | Upload, listagem, download e WebSocket de tempo real |
 | **fiapx-video-processor-worker** *(você está aqui)* | Rust 1.94 · Tokio | Extração de quadros com FFmpeg e compactação em `.zip` |
 | [fiapx-notification-service](https://github.com/rodolfomedeiros/fiapx-notification-service) | Go 1.25 | Consumo da DLQ e envio de e-mail de falha |
+| [fiapx-web](https://github.com/rodolfomedeiros/fiapx-web) | React 19 · TypeScript 6 | Interface de upload, acompanhamento e download |
 
 > Para subir o sistema inteiro, use o **fiapx-platform**. Este repositório sozinho precisa
 > de RabbitMQ e MinIO acessíveis, além do FFmpeg no `PATH`.
