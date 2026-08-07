@@ -172,7 +172,19 @@ cargo test
 cobre a coleta ordenada de quadros e a compactação. **Nenhum dos dois precisa de FFmpeg
 instalado nem de rede.**
 
-O CI ainda roda `cargo clippy --all-targets -- -D warnings`.
+O CI ainda roda `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings` e um piso de
+**80% de cobertura de linhas**:
+
+```sh
+cargo llvm-cov --ignore-filename-regex 'src/main\.rs' --fail-under-lines 80
+```
+
+`main.rs` fica de fora porque é transporte — RabbitMQ, S3, métricas —, e exercitá-lo pediria
+os dois serviços de pé. O piso protege `lib.rs`, onde mora a regra de negócio, hoje em 90%.
+É o mesmo recorte que o `gear-up` faz ao excluir `drivers/` do JaCoCo.
+
+O `rustfmt.toml` fixa o estilo do repositório (indentação de 2 espaços, largura de 110): sem
+ele, o padrão do rustfmt reformataria o arquivo inteiro.
 
 ## Contrato de eventos
 

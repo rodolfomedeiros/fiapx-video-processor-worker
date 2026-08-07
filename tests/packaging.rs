@@ -36,7 +36,8 @@ fn quadros_entram_na_ordem_do_video() {
 
   let quadros = collect_frames(dir.path()).unwrap();
 
-  let nomes: Vec<String> = quadros.iter().map(|q| q.file_name().unwrap().to_string_lossy().into_owned()).collect();
+  let nomes: Vec<String> =
+    quadros.iter().map(|q| q.file_name().unwrap().to_string_lossy().into_owned()).collect();
   assert_eq!(nomes, ["frame_0001.png", "frame_0002.png", "frame_0010.png"]);
 }
 

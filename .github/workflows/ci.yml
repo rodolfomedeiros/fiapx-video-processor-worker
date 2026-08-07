@@ -6,7 +6,13 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-        with: { toolchain: '1.94', components: clippy }
+        with:
+          toolchain: '1.94'
+          components: clippy, rustfmt, llvm-tools-preview
+      - run: cargo fmt --check
       - run: cargo clippy --all-targets -- -D warnings
-      - run: cargo test
+      - uses: taiki-e/install-action@cargo-llvm-cov
+      # main.rs é transporte — RabbitMQ, S3, métricas — e exercitá-lo pediria os dois
+      # serviços de pé. A regra de negócio mora em lib.rs, que é o que o piso protege.
+      - run: cargo llvm-cov --ignore-filename-regex 'src/main\.rs' --fail-under-lines 80
       - run: docker build .

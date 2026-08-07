@@ -2,12 +2,12 @@
 use anyhow::{Context, Result};
 use aws_config::BehaviorVersion;
 use aws_credential_types::Credentials;
-use aws_sdk_s3::{config::Region, primitives::ByteStream, Client as S3Client};
+use aws_sdk_s3::{Client as S3Client, config::Region, primitives::ByteStream};
 use futures_util::StreamExt;
 use lapin::{
+  BasicProperties, Channel, Connection, ConnectionProperties, ExchangeKind,
   options::*,
   types::{AMQPValue, FieldTable},
-  BasicProperties, Channel, Connection, ConnectionProperties, ExchangeKind,
 };
 use metrics::{counter, gauge, histogram};
 use metrics_exporter_prometheus::PrometheusBuilder;
@@ -18,8 +18,8 @@ use std::{
 };
 use tempfile::tempdir;
 use worker::{
-  decide, extract_frames, result_key, zip_frames, Outcome, VideoEvent, EXCHANGE, FAILED_KEY, PROCESSING_QUEUE,
-  RECEIVED_KEY,
+  EXCHANGE, FAILED_KEY, Outcome, PROCESSING_QUEUE, RECEIVED_KEY, VideoEvent, decide, extract_frames,
+  result_key, zip_frames,
 };
 
 fn bucket() -> String {

@@ -181,11 +181,7 @@ pub fn zip_frames(frames: &[PathBuf], destination: &Path) -> Result<u32> {
   let options = zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated);
   let mut buffer = Vec::new();
   for frame in frames {
-    let name = frame
-      .file_name()
-      .context("frame sem nome de arquivo")?
-      .to_string_lossy()
-      .into_owned();
+    let name = frame.file_name().context("frame sem nome de arquivo")?.to_string_lossy().into_owned();
     zip.start_file(name, options)?;
     buffer.clear();
     File::open(frame)?.read_to_end(&mut buffer)?;

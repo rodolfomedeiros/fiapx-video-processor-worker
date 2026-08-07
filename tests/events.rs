@@ -2,7 +2,7 @@
 use serde_json::Value;
 use std::time::Duration;
 use uuid::Uuid;
-use worker::{backoff, decide, result_key, MAX_ATTEMPTS, Outcome, VideoEvent};
+use worker::{MAX_ATTEMPTS, Outcome, VideoEvent, backoff, decide, result_key};
 
 fn recebido(attempt: u8) -> VideoEvent {
   VideoEvent {
@@ -109,7 +109,11 @@ fn ultima_falha_marca_erro_e_emite_video_failed() {
       assert_eq!(status.error_message.as_deref(), Some("ffmpeg falhou"));
       assert_eq!(failure.event_type, "video.failed");
       assert_eq!(failure.error_message.as_deref(), Some("ffmpeg falhou"));
-      assert_eq!(failure.user_email.as_deref(), Some("ana@example.com"), "o e-mail é o destino da notificação");
+      assert_eq!(
+        failure.user_email.as_deref(),
+        Some("ana@example.com"),
+        "o e-mail é o destino da notificação"
+      );
     }
     outro => panic!("deveria desistir, veio {outro:?}"),
   }
