@@ -53,7 +53,9 @@ flowchart TB
 
 ```mermaid
 flowchart LR
-    A["video.received"] --> B["publica PROCESSING"]
+    A["video.received"] --> Z{"ZIP já está<br/>no bucket?"}
+    Z -->|"sim (reentrega)"| H
+    Z -->|não| B["publica PROCESSING"]
     B --> C["baixa o original<br/>do object storage"]
     C --> D["FFmpeg<br/>-vf fps=1"]
     D --> E{"gerou<br/>quadros?"}
@@ -84,8 +86,8 @@ docker compose up -d --scale video-processor-worker=4
 ```
 
 No Kubernetes, o HPA cuida disso — com `terminationGracePeriodSeconds: 120`, para que o
-vídeo em curso termine antes do pod sair; caso contrário a mensagem voltaria à fila e o
-trabalho seria refeito do zero.
+vídeo em curso termine antes do pod sair. Quando a janela não basta, a mensagem volta à fila
+e a checagem de reentrega abaixo evita refazer o trabalho.
 
 ## Retentativas
 
@@ -96,6 +98,21 @@ Uma falha republica o evento em `video.received` com `attempt` incrementado, esp
 Falha ao **publicar** o resultado é tratada à parte: a mensagem vai para a DLQ em vez de
 voltar à fila, porque devolvê-la criaria um laço quente contra um broker que já está com
 problema — e a DLQ, por si só, já notifica o usuário.
+
+## Reentrega
+
+O RabbitMQ entrega ao menos uma vez. Uma réplica derrubada antes do `ack` — scale-down do
+HPA, evicção do pod — devolve a mensagem à fila, e sem cuidado o vídeo passaria pelo FFmpeg
+outra vez.
+
+Antes de processar, o worker consulta o bucket pela chave de resultado daquele vídeo. Se o
+ZIP já está lá, o trabalho foi concluído e só falta reanunciar: ele publica `COMPLETED` e
+confirma a mensagem. O `frame_count` viaja como metadado do objeto, gravado junto ao ZIP,
+para não ser preciso reabrir o arquivo só para contar os quadros.
+
+O próprio resultado é a marca de idempotência, o que dispensa uma tabela de eventos
+processados. ZIP gravado por uma versão anterior não tem o metadado; nesse caso o vídeo é
+reprocessado, que é o desfecho seguro.
 
 ## Configuração
 
@@ -127,7 +144,7 @@ processo que não é um servidor web.
 
 | Métrica | O que mede |
 | :--- | :--- |
-| `fiapx_worker_videos_total{outcome}` | Vídeos por desfecho: `completed`, `retried`, `failed` |
+| `fiapx_worker_videos_total{outcome}` | Vídeos por desfecho: `completed`, `retried`, `failed`, `deduplicated` |
 | `fiapx_worker_videos_in_flight` | Vídeos sendo processados agora — o sinal natural para o HPA |
 | `fiapx_worker_processing_duration_seconds` | Histograma da duração do processamento |
 | `fiapx_worker_frames_extracted_total` | Total de quadros extraídos |

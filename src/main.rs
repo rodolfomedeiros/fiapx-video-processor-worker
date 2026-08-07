@@ -26,6 +26,20 @@ fn bucket() -> String {
   env::var("S3_BUCKET").unwrap_or_else(|_| "videos".into())
 }
 
+/// Total de quadros gravado junto ao ZIP, para que uma reentrega possa reanunciar o
+/// resultado sem reabrir o arquivo.
+const FRAME_COUNT_METADATA: &str = "frame-count";
+
+/// Resultado já presente no bucket, quando a mensagem é a reentrega de um vídeo que o
+/// worker concluiu mas não chegou a confirmar. Ausente o metadado — ZIP gravado por uma
+/// versão anterior —, o vídeo é reprocessado, que é o desfecho seguro.
+async fn existing_result(s3: &S3Client, event: &VideoEvent) -> Option<(String, u32)> {
+  let destination = result_key(&event.user_id, &event.video_id);
+  let head = s3.head_object().bucket(bucket()).key(&destination).send().await.ok()?;
+  let frame_count = head.metadata()?.get(FRAME_COUNT_METADATA)?.parse().ok()?;
+  Some((destination, frame_count))
+}
+
 async fn publish(channel: &Channel, routing_key: &str, event: &VideoEvent) -> Result<()> {
   let body = serde_json::to_vec(event)?;
   channel
@@ -82,12 +96,22 @@ async fn process(s3: &S3Client, event: &VideoEvent) -> Result<(String, u32)> {
     .key(&destination)
     .body(ByteStream::from_path(&zip_path).await?)
     .content_type("application/zip")
+    .metadata(FRAME_COUNT_METADATA, frame_count.to_string())
     .send()
     .await?;
   Ok((destination, frame_count))
 }
 
 async fn handle(channel: &Channel, s3: &S3Client, event: VideoEvent) -> Result<()> {
+  // O RabbitMQ entrega ao menos uma vez: um worker derrubado antes do ack — scale-down do
+  // HPA, evicção do pod — faz a mensagem voltar para a fila. Refazer a extração custaria
+  // outro FFmpeg inteiro, então quando o ZIP já está no bucket só falta reanunciar.
+  if let Some((zip_path, frame_count)) = existing_result(s3, &event).await {
+    eprintln!("vídeo {} já estava processado, reanunciando o resultado", event.video_id);
+    counter!("fiapx_worker_videos_total", "outcome" => "deduplicated").increment(1);
+    return publish(channel, worker::STATUS_KEY, &event.completed(zip_path, frame_count)).await;
+  }
+
   eprintln!("processando vídeo {} (tentativa {})", event.video_id, event.attempt);
   publish(channel, worker::STATUS_KEY, &event.processing()).await?;
 
